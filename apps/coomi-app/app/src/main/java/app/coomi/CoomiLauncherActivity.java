@@ -44,6 +44,7 @@ public class CoomiLauncherActivity extends Activity {
     private static final String PREFS_NAME = "coomi_launcher";
     private static final String PREF_CONTINUE = "onboarding_continue";
     private static final String PREF_SETUP_COMPLETED = "setup_completed";
+    private static final String PREF_ROOT_GRANTED_HINT = "root_granted_hint";
 
     public static void markSetupCompleted(Context context) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -68,6 +69,7 @@ public class CoomiLauncherActivity extends Activity {
     private RootAccessController mRootAccessController;
     private ShizukuAccessController mShizukuAccessController;
     private boolean mRootCheckInFlight = false;
+    private boolean mRootRequestedThisSession = false;
     private boolean mShizukuCheckInFlight = false;
     private boolean mPermissionsDone = false;
     private boolean mContinuePersisted = false;
@@ -198,6 +200,11 @@ public class CoomiLauncherActivity extends Activity {
 
     /** Root is an optional capability check and never gates bootstrap installation. */
     private void checkRootPermission() {
+        mRootRequestedThisSession = true;
+        refreshRootStatus();
+    }
+
+    private void refreshRootStatus() {
         if (mRootCheckInFlight || mRootAccessController == null) return;
         mRootCheckInFlight = true;
         mRootButton.setEnabled(false);
@@ -207,25 +214,35 @@ public class CoomiLauncherActivity extends Activity {
                 || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && isDestroyed())) {
                 return;
             }
-            mRootCheckInFlight = false;
-            switch (result.status) {
-                case GRANTED:
-                    mRootButton.setText(R.string.coomi_authorized);
-                    mRootButton.setEnabled(false);
-                    break;
-                case UNAVAILABLE:
-                    mRootButton.setText(R.string.coomi_root_unavailable);
-                    mRootButton.setEnabled(true);
-                    break;
-                case DENIED:
-                case TIMEOUT:
-                case ERROR:
-                default:
-                    mRootButton.setText(R.string.coomi_root_retry);
-                    mRootButton.setEnabled(true);
-                    break;
-            }
+            applyRootResult(result);
         });
+    }
+
+    private void applyRootResult(RootAccessController.Result result) {
+        mRootCheckInFlight = false;
+        switch (result.status) {
+            case GRANTED:
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putBoolean(PREF_ROOT_GRANTED_HINT, true).apply();
+                mRootButton.setText(R.string.coomi_authorized);
+                mRootButton.setEnabled(false);
+                break;
+            case DENIED:
+            case UNAVAILABLE:
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putBoolean(PREF_ROOT_GRANTED_HINT, false).apply();
+                mRootButton.setText(result.status == RootAccessController.Status.DENIED
+                    ? R.string.coomi_root_retry
+                    : R.string.coomi_root_unavailable);
+                mRootButton.setEnabled(true);
+                break;
+            case TIMEOUT:
+            case ERROR:
+            default:
+                mRootButton.setText(R.string.coomi_root_retry);
+                mRootButton.setEnabled(true);
+                break;
+        }
     }
 
     private void requestShizukuPermission() {
@@ -289,6 +306,12 @@ public class CoomiLauncherActivity extends Activity {
 
         if (mShizukuAccessController != null) {
             updateShizukuButton(mShizukuAccessController.getStatus());
+        }
+
+        boolean rootGrantedHint = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(PREF_ROOT_GRANTED_HINT, false);
+        if (rootGrantedHint || mRootRequestedThisSession) {
+            refreshRootStatus();
         }
 
         // 演示包不为权限拦人：这两个开关只影响引擎常驻，而演示包没有引擎。

@@ -186,6 +186,47 @@ pub fn set_mcp_enabled(home: &Path, name: &str, enabled: bool) -> Result<()> {
     })
 }
 
+pub fn save_custom_mcp(home: &Path, name: &str, config: &Value, replace: bool) -> Result<()> {
+    validate_name(name)?;
+    let object = config.as_object().context("MCP config must be an object")?;
+    let transport = object
+        .get("transport")
+        .and_then(Value::as_str)
+        .unwrap_or("stdio");
+    anyhow::ensure!(matches!(transport, "stdio" | "http"), "transport must be stdio or http");
+    if transport == "stdio" {
+        anyhow::ensure!(
+            object.get("command").and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty()),
+            "stdio MCP requires a non-empty command"
+        );
+    } else {
+        let url = object.get("url").and_then(Value::as_str).unwrap_or_default();
+        let parsed = reqwest::Url::parse(url).context("http MCP requires a valid url")?;
+        anyhow::ensure!(matches!(parsed.scheme(), "http" | "https"), "MCP url must use http or https");
+    }
+    for key in ["args", "env", "headers"] {
+        if let Some(value) = object.get(key) {
+            anyhow::ensure!(value.is_array() || value.is_object(), "MCP `{key}` must be an array or object");
+        }
+    }
+    let path = home.join("config").join("mcp_servers.json");
+    let mut document = read_json_or_default(&path, json!({"version": 1, "servers": {}}))?;
+    let servers = document
+        .get_mut("servers")
+        .and_then(Value::as_object_mut)
+        .context("mcp_servers.json has no servers object")?;
+    if servers.contains_key(name) && !replace {
+        anyhow::bail!("MCP `{name}` already exists")
+    }
+    let mut record = config.clone();
+    record
+        .as_object_mut()
+        .expect("validated MCP object")
+        .insert("enabled".into(), Value::Bool(true));
+    servers.insert(name.to_owned(), record);
+    save_json(&path, &document)
+}
+
 pub fn remove_configured_mcp(home: &Path, name: &str) -> Result<()> {
     update_mcp_document(home, |servers| {
         anyhow::ensure!(
@@ -266,5 +307,38 @@ mod tests {
         assert!(!list_configured_mcp(home.path()).expect("list")[0].enabled);
         remove_configured_mcp(home.path(), "docs").expect("remove");
         assert!(list_configured_mcp(home.path()).expect("list").is_empty());
+    }
+
+    #[test]
+    fn saves_custom_mcp_and_rejects_unconfirmed_collision() {
+        let home = tempfile::tempdir().expect("temporary home");
+        save_custom_mcp(
+            home.path(),
+            "custom",
+            &json!({"transport":"stdio","command":"uvx","args":["demo"]}),
+            false,
+        ).expect("save MCP");
+        assert!(save_custom_mcp(
+            home.path(), "custom", &json!({"transport":"stdio","command":"other"}), false
+        ).is_err());
+        save_custom_mcp(
+            home.path(),
+            "custom",
+            &json!({"transport":"stdio","command":"other"}),
+            true,
+        ).expect("replace MCP");
+        let listed = list_configured_mcp(home.path()).expect("list MCP");
+        assert_eq!(listed[0].target, "other");
+        assert!(listed[0].enabled);
+    }
+
+    #[test]
+    fn validates_custom_mcp_transport_requirements() {
+        let home = tempfile::tempdir().expect("temporary home");
+        assert!(save_custom_mcp(home.path(), "bad/name", &json!({"command":"x"}), false).is_err());
+        assert!(save_custom_mcp(home.path(), "bad", &json!({"transport":"stdio"}), false).is_err());
+        assert!(save_custom_mcp(home.path(), "bad", &json!({"transport":"http","url":"file:///tmp"}), false).is_err());
+        save_custom_mcp(home.path(), "http", &json!({"transport":"http","url":"https://example.test"}), false)
+            .expect("save HTTP MCP");
     }
 }

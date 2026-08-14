@@ -37,6 +37,7 @@ import androidx.core.content.ContextCompat;
 import com.termux.BuildConfig;
 
 import app.coomi.CoomiConstants;
+import app.coomi.CoomiBootstrap;
 import app.coomi.CoomiDemo;
 import app.coomi.CoomiEngineMonitor;
 import app.coomi.CoomiService;
@@ -54,6 +55,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -72,6 +74,7 @@ public class CoomiActivity extends Activity {
     private static final int REQUEST_AUTHORIZE_TREE = 2102;
     private static final int REQUEST_EXPORT_FILE = 2103;
     private static final int REQUEST_SAVE_IMAGE = 2104;
+    private static final int REQUEST_IMPORT_SKILL_DIRECTORY = 2105;
     /** 旧系统（API < 29）走 SAF 保存对话框时的待写图片数据。 */
     private byte[] mPendingImageBytes;
     private String mPendingImageName;
@@ -98,6 +101,7 @@ public class CoomiActivity extends Activity {
     private String mPendingExportName;
     private String mPendingImportRequestId;
     private String mPendingExportRequestId;
+    private String mPendingSkillStagingId;
     private String mAppliedThemeMode;
 
     private final ServiceConnection mConnection = new ServiceConnection() {
@@ -500,6 +504,16 @@ public class CoomiActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void importSkillDirectory() {
+            runOnUiThread(() -> {
+                mPendingSkillStagingId = UUID.randomUUID().toString().replace("-", "");
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                startActivityForResult(intent, REQUEST_IMPORT_SKILL_DIRECTORY);
+            });
+        }
+
+        @JavascriptInterface
         public void exportFile(String path, String suggestedName) {
             mPendingExportRequestId = null;
             launchExportPicker(path, suggestedName);
@@ -668,6 +682,9 @@ public class CoomiActivity extends Activity {
             } else if (requestCode == REQUEST_EXPORT_FILE && mPendingExportRequestId != null) {
                 emitFileExported(mPendingExportRequestId, null);
                 mPendingExportRequestId = null;
+            } else if (requestCode == REQUEST_IMPORT_SKILL_DIRECTORY) {
+                mPendingSkillStagingId = null;
+                emitSkillDirectoryResult(null, "cancelled");
             }
             return;
         }
@@ -681,6 +698,11 @@ public class CoomiActivity extends Activity {
                 uris.add(data.getData());
             }
             new Thread(() -> importUris(uris), "coomi-file-import").start();
+        } else if (requestCode == REQUEST_IMPORT_SKILL_DIRECTORY && data.getData() != null) {
+            Uri tree = data.getData();
+            String stagingId = mPendingSkillStagingId;
+            mPendingSkillStagingId = null;
+            new Thread(() -> stageSkillDirectory(tree, stagingId), "coomi-skill-import").start();
         } else if (requestCode == REQUEST_AUTHORIZE_TREE && data.getData() != null) {
             authorizeTree(data.getData(), data.getFlags());
         } else if (requestCode == REQUEST_EXPORT_FILE && data.getData() != null) {
@@ -703,6 +725,47 @@ public class CoomiActivity extends Activity {
                 runOnUiThread(() -> Toast.makeText(
                     CoomiActivity.this, saved ? "已保存" : "保存失败", Toast.LENGTH_SHORT).show());
             }, "coomi-image-save").start();
+        }
+    }
+
+    private void stageSkillDirectory(Uri tree, String stagingId) {
+        if (stagingId == null) return;
+        File staging = new File(CoomiConstants.COOMI_CONFIG_DIR + "/cache/custom-skill-staging/" + stagingId);
+        try {
+            if (!staging.mkdirs() && !staging.isDirectory()) throw new IllegalStateException("无法创建 Skill 临时目录");
+            copyTreeDocument(tree, staging);
+            if (!new File(staging, "SKILL.md").isFile()) throw new IllegalStateException("所选目录必须直接包含 SKILL.md");
+            emitSkillDirectoryResult(stagingId, null);
+        } catch (Exception error) {
+            CoomiBootstrap.deleteRecursive(staging);
+            emitSkillDirectoryResult(null, error.getMessage());
+        }
+    }
+
+    private void copyTreeDocument(Uri tree, File destination) throws Exception {
+        String documentId = DocumentsContract.getTreeDocumentId(tree);
+        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, documentId);
+        try (Cursor cursor = getContentResolver().query(children,
+                new String[]{DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME, DocumentsContract.Document.COLUMN_MIME_TYPE},
+                null, null, null)) {
+            if (cursor == null) throw new IllegalStateException("无法读取所选目录");
+            while (cursor.moveToNext()) {
+                String childId = cursor.getString(0);
+                String name = sanitizeName(cursor.getString(1));
+                String mime = cursor.getString(2);
+                Uri child = DocumentsContract.buildDocumentUriUsingTree(tree, childId);
+                File target = new File(destination, name);
+                if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
+                    if (!target.mkdirs() && !target.isDirectory()) throw new IllegalStateException("无法创建目录");
+                    copyTreeDocument(child, target);
+                } else {
+                    try (InputStream input = getContentResolver().openInputStream(child);
+                         OutputStream output = new FileOutputStream(target)) {
+                        if (input == null) throw new IllegalStateException("无法读取文件 " + name);
+                        copyStream(input, output);
+                    }
+                }
+            }
         }
     }
 
@@ -835,6 +898,12 @@ public class CoomiActivity extends Activity {
         String request = requestId == null ? "null" : JSONObject.quote(requestId);
         runOnUiThread(() -> evaluateJavascript("window.dispatchEvent(new CustomEvent('coomi:files-imported',{detail:{paths:"
             + paths.toString() + ",requestId:" + request + "}}))"));
+    }
+
+    private void emitSkillDirectoryResult(String stagingId, String error) {
+        String id = stagingId == null ? "null" : JSONObject.quote(stagingId);
+        String message = error == null ? "null" : JSONObject.quote(error);
+        runOnUiThread(() -> evaluateJavascript("window.dispatchEvent(new CustomEvent('coomi:skill-directory-result',{detail:{stagingId:" + id + ",error:" + message + "}}))"));
     }
 
     private void emitFileExported(String requestId, String path) {

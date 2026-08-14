@@ -145,6 +145,25 @@ impl CatalogInstaller {
         self.install_entry(entry, replace)
     }
 
+    pub fn install_local_skill(&self, staging_id: &str, id: &str, replace: bool) -> Result<PathBuf> {
+        validate_skill_id(staging_id)?;
+        validate_skill_id(id)?;
+        let source = self.home.join("cache").join("custom-skill-staging").join(staging_id);
+        anyhow::ensure!(source.join("SKILL.md").is_file(), "selected directory must contain SKILL.md");
+        let destination = self.home.join("skills").join(id);
+        if destination.exists() && !replace { anyhow::bail!("Skill `{id}` already installed"); }
+        let temporary = self.home.join("cache").join(format!("skill-{id}-importing"));
+        if temporary.exists() { fs::remove_dir_all(&temporary)?; }
+        copy_directory(&source, &temporary)?;
+        if destination.exists() { fs::remove_dir_all(&destination)?; }
+        if let Some(parent) = destination.parent() { fs::create_dir_all(parent)?; }
+        fs::rename(&temporary, &destination)?;
+        let entry = SkillEntry { id: id.to_owned(), name: id.to_owned(), description: "Custom local Skill".into(), repository: "local".into(), git_ref: "local".into(), subdir: ".".into() };
+        save_skill_metadata(&self.home, &entry, &destination, "local")?;
+        fs::remove_dir_all(&source)?;
+        Ok(destination)
+    }
+
     /// 卸载 Skill：删除 skills/{id} 目录与 config/skills.json 中的条目。
     pub fn uninstall_skill(&self, id: &str) -> Result<PathBuf> {
         // 与安装一致：id 必须先在内置目录中解析出合法条目，杜绝路径穿越
@@ -444,6 +463,31 @@ mod tests {
         assert!(matches_skill_subdir("shizuku-skill-main/agents/openai.yaml", "."));
         assert!(!matches_skill_subdir("shizuku-skill-main/other/SKILL.md", "agents"));
     }
+
+    #[test]
+    fn parses_github_skill_repository_urls() {
+        assert_eq!(
+            parse_github_skill_url("https://github.com/acme/my-skill.git").unwrap(),
+            ("acme/my-skill".to_owned(), "my-skill".to_owned())
+        );
+        assert!(parse_github_skill_url("https://gitlab.com/acme/my-skill").is_err());
+        assert!(parse_github_skill_url("https://github.com/acme").is_err());
+    }
+}
+
+fn validate_skill_id(id: &str) -> Result<()> {
+    anyhow::ensure!(!id.is_empty() && id.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-') && !id.starts_with('-'), "invalid Skill id");
+    Ok(())
+}
+
+pub fn parse_github_skill_url(url: &str) -> Result<(String, String)> {
+    let parsed = reqwest::Url::parse(url).context("invalid GitHub repository URL")?;
+    anyhow::ensure!(parsed.scheme() == "https" && parsed.host_str() == Some("github.com"), "Skill URL must be an https://github.com URL");
+    let parts = parsed.path_segments().map(|segments| segments.filter(|part| !part.is_empty()).collect::<Vec<_>>()).unwrap_or_default();
+    anyhow::ensure!(parts.len() == 2, "GitHub URL must contain owner and repository");
+    let repository = parts[1].trim_end_matches(".git");
+    anyhow::ensure!(!parts[0].contains('.') && !repository.is_empty() && !repository.contains('.'), "invalid GitHub repository");
+    Ok((format!("{}/{}", parts[0], repository), repository.to_owned()))
 }
 
 fn matches_skill_subdir(path: &str, subdir: &str) -> bool {

@@ -8,7 +8,20 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import PageHead from '@/components/PageHead.vue'
 import CoomiIcon from '@/components/CoomiIcon.vue'
-import { authedFetch } from '@/bridge/http'
+import { authedFetch as rawAuthedFetch } from '@/bridge/http'
+
+async function authedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const res = await rawAuthedFetch(input, init)
+  const path = typeof input === 'string' ? input : input.toString()
+  if (res.status !== 409 || !path.includes('/api/catalog/skills/custom/') && !path.includes('/api/catalog/mcp/custom')) return res
+  const data = await res.clone().json().catch(() => ({}))
+  const label = path.includes('/mcp/') ? 'MCP Server' : 'Skill'
+  if (!window.confirm(`${data.error ?? `${label} 已存在`}\n\n是否覆盖已有配置？`)) return res
+  let body: any = {}
+  try { body = init?.body ? JSON.parse(String(init.body)) : {} } catch { return res }
+  body.replace = true
+  return rawAuthedFetch(input, { ...init, body: JSON.stringify(body) })
+}
 
 const router = useRouter()
 
@@ -58,6 +71,12 @@ const loading = ref(true)
 const error = ref('')
 const busy = ref<string | null>(null)
 const notice = ref('')
+const addMenuOpen = ref(false)
+const addKind = ref<'skill' | 'mcp' | null>(null)
+const skillForm = ref({ repository_url: '', id: '' })
+const mcpInputMode = ref<'form' | 'json'>('form')
+const mcpForm = ref({ name: '', transport: 'stdio', command: '', args: '', env: '', url: '', headers: '' })
+const mcpJson = ref('')
 /** 当前展开详情的卡片 id（卡片默认折叠，只显示名称）。 */
 const expanded = ref<string | null>(null)
 function toggleExpanded(id: string) {
@@ -352,6 +371,40 @@ async function installSkill(item: SkillItem) {
 }
 
 onMounted(load)
+function openAdd(kind: 'skill' | 'mcp') { addMenuOpen.value = false; addKind.value = kind; notice.value = '' }
+function closeAdd() { addKind.value = null }
+function resetAdd() {
+  closeAdd(); skillForm.value = { repository_url: '', id: '' }
+  mcpForm.value = { name: '', transport: 'stdio', command: '', args: '', env: '', url: '', headers: '' }; mcpJson.value = ''
+}
+async function submitGithubSkill() {
+  const form = skillForm.value
+  busy.value = 'custom-skill'
+  try {
+    const res = await authedFetch('/api/catalog/skills/custom/github', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repository_url: form.repository_url, id: form.id }) })
+    await parseRes(res); notice.value = '已添加自定义 Skill'; resetAdd(); await loadInstalled()
+  } catch (e) { notice.value = `添加失败：${e instanceof Error ? e.message : String(e)}` } finally { busy.value = null }
+}
+function parseObjectLines(value: string) {
+  const result: Record<string, string> = {}
+  for (const line of value.split(/\r?\n/)) { const index = line.indexOf('='); if (index > 0) result[line.slice(0, index).trim()] = line.slice(index + 1).trim() }
+  return result
+}
+async function submitCustomMcp() {
+  try {
+    let name = mcpForm.value.name.trim(); let config: any
+    if (mcpInputMode.value === 'json') { config = JSON.parse(mcpJson.value); name = name || String(config.name || '') ; delete config.name }
+    else {
+      name = name.trim(); config = { transport: mcpForm.value.transport }
+      if (config.transport === 'stdio') { config.command = mcpForm.value.command.trim(); config.args = mcpForm.value.args.split(/\s+/).filter(Boolean); config.env = parseObjectLines(mcpForm.value.env) }
+      else { config.url = mcpForm.value.url.trim(); config.headers = parseObjectLines(mcpForm.value.headers) }
+    }
+    if (!name) throw new Error('请填写 MCP 名称')
+    busy.value = 'custom-mcp'
+    const res = await authedFetch('/api/catalog/mcp/custom', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, config }) })
+    await parseRes(res); notice.value = '已添加自定义 MCP Server'; resetAdd(); await loadInstalled()
+  } catch (e) { notice.value = `添加失败：${e instanceof Error ? e.message : String(e)}` } finally { busy.value = null }
+}
 // 从控制台进入：返回统一回控制台（浏览器环境回聊天主页）
 function goDashboard() {
   if (window.CoomiAndroid?.openDashboard) window.CoomiAndroid.openDashboard()
@@ -364,7 +417,8 @@ function goDashboard() {
     <PageHead title="拓展管理" @back="goDashboard" />
     <main class="body">
       <!-- 一级：已安装 | 仓库 | 市场 -->
-      <div class="seg" role="tablist">
+      <div class="scope-row">
+        <div class="seg" role="tablist">
         <button class="segitem" :class="{ on: scope === 'installed' }" @click="switchScope('installed')">
           <CoomiIcon name="check" :size="14" />已安装
         </button>
@@ -377,6 +431,17 @@ function goDashboard() {
       </div>
 
       <!-- 二级：MCP | Skills（市场视图下另有 Workflow） -->
+        <div class="add-wrap">
+          <button class="add-btn" aria-label="添加自定义扩展" title="添加自定义扩展" @click="addMenuOpen = !addMenuOpen">
+            <CoomiIcon name="plus" :size="18" />
+          </button>
+          <div v-if="addMenuOpen" class="add-menu">
+            <button @click="openAdd('skill')"><CoomiIcon name="wrench" :size="15" />添加 Skill</button>
+            <button @click="openAdd('mcp')"><CoomiIcon name="plug" :size="15" />添加 MCP Server</button>
+          </div>
+        </div>
+      </div>
+
       <div class="tabs">
         <button class="tab" :class="{ on: tab === 'mcp' }" @click="tab = 'mcp'">
           <CoomiIcon name="plug" :size="15" />MCP
@@ -663,6 +728,32 @@ function goDashboard() {
           </div>
         </div>
       </div>
+
+      <div v-if="addKind === 'skill'" class="sheet-mask" @click.self="resetAdd">
+        <div class="sheet">
+          <div class="grip" /><div class="stitle"><CoomiIcon name="wrench" :size="17" />添加自定义 Skill</div>
+          <div class="mode-tabs"><button class="on">GitHub 主仓库</button></div>
+          <label class="field"><span>仓库地址</span><input v-model="skillForm.repository_url" placeholder="https://github.com/owner/repo" /></label>
+          <label class="field"><span>Skill ID</span><input v-model="skillForm.id" placeholder="默认使用仓库名" /></label>
+          <p class="sdesc">将使用仓库的 main 分支和根目录。</p>
+          <div class="sheet-actions"><button class="btn ghost" @click="resetAdd">取消</button><button class="btn primary" :disabled="busy !== null || !skillForm.repository_url" @click="submitGithubSkill">添加</button></div>
+        </div>
+      </div>
+
+      <div v-if="addKind === 'mcp'" class="sheet-mask" @click.self="resetAdd">
+        <div class="sheet">
+          <div class="grip" /><div class="stitle"><CoomiIcon name="plug" :size="17" />添加自定义 MCP Server</div>
+          <div class="mode-tabs"><button :class="{ on: mcpInputMode === 'form' }" @click="mcpInputMode = 'form'">表单</button><button :class="{ on: mcpInputMode === 'json' }" @click="mcpInputMode = 'json'">JSON</button></div>
+          <template v-if="mcpInputMode === 'form'">
+            <label class="field"><span>名称</span><input v-model="mcpForm.name" placeholder="例如 my-server" /></label>
+            <label class="field"><span>Transport</span><select v-model="mcpForm.transport"><option value="stdio">stdio</option><option value="http">HTTP</option></select></label>
+            <template v-if="mcpForm.transport === 'stdio'"><label class="field"><span>启动命令</span><input v-model="mcpForm.command" placeholder="npx" /></label><label class="field"><span>参数，每行一个或空格分隔</span><input v-model="mcpForm.args" placeholder="-y package" /></label><label class="field"><span>环境变量，每行 KEY=VALUE</span><textarea v-model="mcpForm.env" /></label></template>
+            <template v-else><label class="field"><span>服务 URL</span><input v-model="mcpForm.url" placeholder="https://example.com/mcp" /></label><label class="field"><span>请求头，每行 KEY=VALUE</span><textarea v-model="mcpForm.headers" /></label></template>
+          </template>
+          <template v-else><label class="field"><span>名称（可从 JSON 的 name 读取）</span><input v-model="mcpForm.name" placeholder="my-server" /></label><label class="field"><span>MCP 配置对象</span><textarea v-model="mcpJson" class="json-input" placeholder="{ &quot;transport&quot;: &quot;stdio&quot;, &quot;command&quot;: &quot;npx&quot; }" /></label></template>
+          <div class="sheet-actions"><button class="btn ghost" @click="resetAdd">取消</button><button class="btn primary" :disabled="busy !== null" @click="submitCustomMcp">添加</button></div>
+        </div>
+      </div>
     </main>
   </div>
 </template>
@@ -674,7 +765,21 @@ function goDashboard() {
   padding: 14px 12px calc(var(--safe-bottom) + 24px);
   -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain;
 }
+.scope-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.scope-row .seg { margin-bottom: 0; }
+.scope-row > .add-wrap { flex-shrink: 0; }
 .tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+.add-wrap { position: relative; flex-shrink: 0; }
+.add-btn { width: 42px; height: 42px; display: flex; align-items: center; justify-content: center; border: 0; border-radius: var(--r-md); background: var(--fill-strong); color: var(--blue); }
+.add-menu { position: absolute; z-index: 20; right: 0; top: 48px; width: 170px; padding: 5px; border-radius: var(--r-md); background: var(--bg); box-shadow: var(--shadow-2); }
+.add-menu button { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 38px; padding: 0 9px; border: 0; border-radius: 8px; background: none; color: var(--text); text-align: left; }
+.add-menu button:active { background: var(--fill); }
+.mode-tabs { display: flex; gap: 6px; margin-top: 14px; }
+.mode-tabs button { flex: 1; min-height: 34px; border: 0; border-radius: var(--r-pill); background: var(--fill-strong); color: var(--text-2); }
+.mode-tabs button.on { background: var(--blue-soft); color: var(--blue); }
+.field textarea, .field select { min-height: 42px; padding: 9px 12px; border-radius: var(--r-md); border: 1px solid var(--border); background: var(--bg-input); color: var(--text); font: inherit; }
+.field textarea { min-height: 72px; resize: vertical; }
+.json-input { min-height: 130px !important; font-family: monospace !important; }
 .submit-extension {
   display: flex; align-items: center; justify-content: space-between;
   min-height: 44px; margin: -2px 0 14px; padding: 0 13px;

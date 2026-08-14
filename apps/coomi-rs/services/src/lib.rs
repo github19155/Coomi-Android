@@ -18,6 +18,7 @@ pub use catalog_state::list_installed_skills;
 pub use catalog_state::remove_configured_mcp;
 pub use catalog_state::remove_installed_skill;
 pub use catalog_state::set_mcp_enabled;
+pub use catalog_state::save_custom_mcp;
 pub use catalog_state::set_skill_enabled;
 pub use config::ModelChoice;
 pub use config::ProviderConfig;

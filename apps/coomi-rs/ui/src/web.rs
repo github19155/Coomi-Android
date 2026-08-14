@@ -387,12 +387,21 @@ pub async fn serve(
         .route("/api/fs/write", post(fs_write))
         .route("/api/catalog", get(catalog_index))
         .route("/api/catalog/mcp/install", post(install_mcp_catalog))
+        .route("/api/catalog/mcp/custom", post(save_custom_mcp))
         .route("/api/catalog/mcp/{id}", delete(uninstall_mcp_catalog))
         .route(
             "/api/catalog/mcp/{id}/enabled",
             post(set_mcp_enabled_catalog),
         )
         .route("/api/catalog/skills/install", post(install_skill_catalog))
+        .route(
+            "/api/catalog/skills/custom/github",
+            post(install_custom_github_skill),
+        )
+        .route(
+            "/api/catalog/skills/custom/local",
+            post(install_custom_local_skill),
+        )
         .route(
             "/api/catalog/skills/install-remote",
             post(install_skill_remote),
@@ -950,6 +959,35 @@ async fn install_mcp_catalog(
     ))
 }
 
+async fn save_custom_mcp(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("missing name"))?
+        .trim()
+        .to_owned();
+    let config = body.get("config").cloned().unwrap_or_else(|| json!({}));
+    let replace = body.get("replace").and_then(Value::as_bool).unwrap_or(false);
+    let home = state.home.clone();
+    let task_name = name.clone();
+    tokio::task::spawn_blocking(move || coomi_services::save_custom_mcp(&home, &task_name, &config, replace))
+        .await
+        .map_err(|e| ApiError::internal(format!("MCP save task failed: {e}")))?
+        .map_err(|e| {
+            let message = e.to_string();
+            if message.contains("already exists") {
+                ApiError::conflict(message)
+            } else {
+                ApiError::bad_request(message)
+            }
+        })?;
+    Ok(Json(json!({"ok": true, "name": name, "enabled": true})))
+}
+
 /// 卸载 MCP server：从 config/mcp_servers.json 移除对应条目。
 async fn uninstall_mcp_catalog(
     State(state): State<AppState>,
@@ -1010,6 +1048,58 @@ async fn install_skill_catalog(
     Ok(Json(
         json!({ "ok": true, "id": id, "path": path.display().to_string() }),
     ))
+}
+
+async fn install_custom_github_skill(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let repository_url = body
+        .get("repository_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("missing repository_url"))?;
+    let (repository, repository_name) = coomi_catalogs::parse_github_skill_url(repository_url)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let id = body.get("id").and_then(Value::as_str).unwrap_or(&repository_name).trim().to_owned();
+    if id.is_empty() || !id.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-') || id.starts_with('-') {
+        return Err(ApiError::bad_request("invalid Skill id"));
+    }
+    let git_ref = body.get("ref").and_then(Value::as_str).unwrap_or("main").trim().to_owned();
+    let subdir = body.get("subdir").and_then(Value::as_str).unwrap_or(".").trim().trim_matches('/').to_owned();
+    if git_ref.is_empty() || git_ref.contains("..") || subdir.split('/').any(|part| part.is_empty() || part == "..") {
+        return Err(ApiError::bad_request("invalid ref or subdir"));
+    }
+    let replace = body.get("replace").and_then(Value::as_bool).unwrap_or(false);
+    let entry = SkillEntry { id: id.clone(), name: id.clone(), description: "Custom GitHub Skill".into(), repository, git_ref, subdir };
+    let home = state.home.clone();
+    let task_id = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let installer = coomi_catalogs::CatalogInstaller::new(&home);
+        installer.install_remote_skill(&entry, replace)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("Skill install task failed: {e}")))?
+    .map_err(|e| {
+        let message = e.to_string();
+        if message.contains("already installed") { ApiError::conflict(message) } else { ApiError::internal(format!("failed to install Skill {task_id}: {message}")) }
+    })?;
+    Ok(Json(json!({"ok": true, "id": task_id, "path": result.display().to_string()})))
+}
+
+async fn install_custom_local_skill(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let staging_id = body.get("staging_id").and_then(Value::as_str).ok_or_else(|| ApiError::bad_request("missing staging_id"))?.to_owned();
+    let id = body.get("id").and_then(Value::as_str).ok_or_else(|| ApiError::bad_request("missing id"))?.trim().to_owned();
+    let replace = body.get("replace").and_then(Value::as_bool).unwrap_or(false);
+    let home = state.home.clone();
+    let task_id = id.clone();
+    let result = tokio::task::spawn_blocking(move || coomi_catalogs::CatalogInstaller::new(&home).install_local_skill(&staging_id, &task_id, replace))
+        .await
+        .map_err(|e| ApiError::internal(format!("Skill import task failed: {e}")))?
+        .map_err(|e| if e.to_string().contains("already installed") { ApiError::conflict(e.to_string()) } else { ApiError::bad_request(e.to_string()) })?;
+    Ok(Json(json!({"ok": true, "id": id, "path": result.display().to_string()})))
 }
 
 /// 安装社区注册表条目（市场）：{ "id", "name", "description", "repository", "ref", "subdir" }。
@@ -3605,6 +3695,10 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
         }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::CONFLICT, message: message.into() }
     }
 
     fn not_found(message: impl Into<String>) -> Self {
